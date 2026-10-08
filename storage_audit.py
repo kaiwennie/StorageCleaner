@@ -4,7 +4,6 @@ Storage Audit & Cleaner Pro
 File: storage_audit.py
 
 Sistem Audit Penyimpanan Native Python (Zero Dependencies / Standar Library)
-Menggunakan modul bawaan: http.server, os, hashlib, json, webbrowser, sys.
 ============================================================================
 """
 
@@ -15,12 +14,13 @@ import hashlib
 import json
 import webbrowser
 import sys
+import subprocess
 from urllib.parse import urlparse
 from datetime import datetime
 
 DEFAULT_PORT = 3000
 DEFAULT_TARGET_FOLDER = './Bahan Latihan P12'
-GIANT_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+GIANT_FILE_THRESHOLD = 2 * 1024 * 1024  # 2 MB
 
 def format_bytes(b):
     if b == 0:
@@ -41,7 +41,6 @@ def get_file_sha256(file_path):
                 h.update(chunk)
         return h.hexdigest()
     except Exception as e:
-        print(f"Error hash {file_path}: {e}")
         return 'ERROR_HASH'
 
 def scan_directory(dir_path, root_path=None):
@@ -55,18 +54,24 @@ def scan_directory(dir_path, root_path=None):
                 full_path = os.path.join(root, file_name)
                 try:
                     stat = os.stat(full_path)
-                    rel_path = os.path.relpath(full_path, root_path)
+                    rel_path = os.path.relpath(full_path, root_path).replace('\\', '/')
+                    folder_dir = os.path.dirname(rel_path)
+                    if folder_dir == '.':
+                        folder_dir = ''
                     ext = os.path.splitext(file_name)[1].lower()
+                    ext_clean = ext.replace('.', '').upper() or 'FILE'
                     is_tmp = (ext == '.tmp')
-                    is_giant = (stat.st_size > GIANT_FILE_THRESHOLD)
+                    is_giant = (stat.st_size >= GIANT_FILE_THRESHOLD)
                     sha256 = get_file_sha256(full_path)
 
                     file_list.append({
                         'fileName': file_name,
-                        'relativePath': rel_path.replace('\\', '/'),
+                        'relativePath': rel_path,
+                        'folderDir': folder_dir,
                         'absolutePath': os.path.abspath(full_path),
                         'sizeBytes': stat.st_size,
                         'sizeFormatted': format_bytes(stat.st_size),
+                        'format': ext_clean,
                         'sha256': sha256,
                         'isTmp': is_tmp,
                         'isGiant': is_giant,
@@ -85,6 +90,7 @@ def analyze_files(files, root_path):
     total_bytes = sum(f['sizeBytes'] for f in files)
     giant_files = [f for f in files if f['isGiant']]
     tmp_files = [f for f in files if f['isTmp']]
+    subfolders_set = {f['folderDir'] for f in files if f.get('folderDir')}
 
     hash_map = {}
     for f in files:
@@ -127,7 +133,8 @@ def analyze_files(files, root_path):
     giant_total_bytes = sum(f['sizeBytes'] for f in giant_files)
 
     return {
-        'rootPath': root_path,
+        'rootPath': os.path.abspath(root_path),
+        'subfolders': sorted(list(subfolders_set)),
         'metrics': {
             'totalFiles': total_files,
             'totalBytes': total_bytes,
@@ -188,8 +195,43 @@ def execute_clean_up(target_folder_path, file_paths_to_delete):
     results['freedFormatted'] = format_bytes(results['freedBytes'])
     return results
 
+def resolve_physical_folder_path(folder_name):
+    if not folder_name:
+        return None
+    user_home = os.path.expanduser('~')
+    candidates = [
+        os.path.abspath(folder_name),
+        os.path.abspath(os.path.join('.', folder_name)),
+        os.path.abspath(os.path.join('..', folder_name)),
+        os.path.join(user_home, 'Desktop', folder_name),
+        os.path.join(user_home, 'Documents', folder_name),
+        os.path.join(user_home, 'Downloads', folder_name),
+        os.path.join(user_home, 'Documents', 'StorageCleaner', folder_name),
+        os.path.join(user_home, folder_name)
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isdir(c):
+            return os.path.abspath(c)
+    if 'bahan latihan' in folder_name.lower():
+        p12 = os.path.abspath('Bahan Latihan P12')
+        if os.path.exists(p12):
+            return p12
+    return None
+
+def open_native_file_explorer(initial_dir=''):
+    ps_script = os.path.join(os.path.dirname(__file__), 'browse_folder.ps1')
+    res_initial = os.path.abspath(initial_dir) if initial_dir and os.path.exists(initial_dir) else os.path.abspath('.')
+    cmd = ["powershell.exe", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_script, "-InitialDirectory", res_initial]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        out = (res.stdout or '').strip()
+        if not out or out == 'CANCELLED':
+            return {'success': False, 'cancelled': True}
+        return {'success': True, 'folderPath': out}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 def get_dashboard_html():
-    # Mengambil HTML yang sama dari storage_audit.js jika ada atau template statis
     js_path = os.path.join(os.path.dirname(__file__), 'storage_audit.js')
     if os.path.exists(js_path):
         with open(js_path, 'r', encoding='utf-8') as f:
@@ -198,10 +240,8 @@ def get_dashboard_html():
             end_tag = '`;\n}'
             if start_tag in content and end_tag in content:
                 part = content.split(start_tag)[1].split(end_tag)[0]
-                # Ganti indikator runtime ke Python
-                part = part.replace('Runtime: Node.js (Active)', 'Runtime: Python (Active)')
                 return part
-    return "<h1>Storage Audit & Cleaner Pro (Python)</h1>"
+    return "<h1>Storage Audit & Cleaner Pro</h1>"
 
 class AuditRequestHandler(http.server.BaseHTTPRequestHandler):
     def end_headers(self):
@@ -223,9 +263,7 @@ class AuditRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(get_dashboard_html().encode('utf-8'))
         else:
             self.send_response(404)
-            self.send_header('Content-Type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'404 Not Found')
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -233,7 +271,26 @@ class AuditRequestHandler(http.server.BaseHTTPRequestHandler):
         body_bytes = self.rfile.read(content_len) if content_len > 0 else b'{}'
         body = json.loads(body_bytes.decode('utf-8')) if body_bytes else {}
 
-        if parsed.path == '/api/scan':
+        if parsed.path == '/api/browse-native':
+            initial_dir = body.get('initialDirectory', '.')
+            res = open_native_file_explorer(initial_dir)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode('utf-8'))
+
+        elif parsed.path == '/api/resolve-folder':
+            fname = body.get('folderName', '')
+            resolved = resolve_physical_folder_path(fname)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            if resolved:
+                self.wfile.write(json.dumps({'success': True, 'resolvedPath': resolved}).encode('utf-8'))
+            else:
+                self.wfile.write(json.dumps({'success': False}).encode('utf-8'))
+
+        elif parsed.path == '/api/scan':
             target_path = body.get('folderPath', DEFAULT_TARGET_FOLDER)
             resolved = os.path.abspath(target_path)
             if not os.path.exists(resolved) or not os.path.isdir(resolved):
@@ -243,7 +300,6 @@ class AuditRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({'error': f'Folder tidak ditemukan: {target_path}'}).encode('utf-8'))
                 return
 
-            print(f"[SCAN] Memindai folder target: {resolved}")
             files = scan_directory(resolved)
             analysis = analyze_files(files, resolved)
             self.send_response(200)
@@ -254,14 +310,6 @@ class AuditRequestHandler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == '/api/clean':
             target_path = body.get('folderPath', DEFAULT_TARGET_FOLDER)
             files_to_delete = body.get('filesToDelete', [])
-            if not files_to_delete:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Tidak ada file untuk dihapus'}).encode('utf-8'))
-                return
-
-            print(f"[CLEAN] In-place clean: {len(files_to_delete)} file")
             results = execute_clean_up(target_path, files_to_delete)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -277,9 +325,9 @@ def run(port=DEFAULT_PORT):
             with socketserver.TCPServer(("", p), AuditRequestHandler) as httpd:
                 url = f"http://localhost:{p}"
                 print("================================================================")
-                print("  STORAGE AUDIT & CLEANER PRO - PYTHON UTILITY")
+                print("  STORAGE AUDIT & CLEANER - DIRECT EXECUTION")
                 print("================================================================")
-                print(f"  Target Folder Default : {os.path.abspath(DEFAULT_TARGET_FOLDER)}")
+                print(f"  Target Harddisk Aktif : {os.path.abspath(DEFAULT_TARGET_FOLDER)}")
                 print(f"  Dashboard URL         : {url}")
                 print("================================================================")
                 webbrowser.open(url)
